@@ -1,0 +1,24 @@
+# Environment variables and secrets
+.env
+
+# Python virtual environments
+.venv/
+.venv-1/
+venv/
+
+# Python cache
+_pycache_/
+*.py[cod]
+
+# VS Code settings
+.vscode/
+
+# Temporary files
+*.log
+.DS_Store
+Thumbs.db
+
+# Database exports and backups
+exports/
+*.sql.gz
+*.bak
