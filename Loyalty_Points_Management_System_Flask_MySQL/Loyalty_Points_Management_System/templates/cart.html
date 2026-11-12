@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block heading %}Your cart{% endblock %}{% block content %}
+<div class="panel"><div class="panel-head"><div><h3>Cart items</h3><p>Review your items before placing the order.</p></div><a href="{{ url_for('shop') }}">Continue shopping</a></div>
+  {% if items %}
+  <div class="table-wrap"><table><thead><tr><th>Product</th><th>Price</th><th>Quantity</th><th>Subtotal</th><th></th></tr></thead><tbody>
+    {% for product, quantity in items %}<tr><td><b>{{ product.name }}</b><small>{{ product.description }}</small></td><td>₹{{ "%.2f"|format(product.price|float) }}</td><td>{{ quantity }}</td><td>₹{{ "%.2f"|format((product.price * quantity)|float) }}</td><td><form method="post" action="{{ url_for('remove_from_cart', product_id=product.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="button button-light">Remove</button></form></td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="cart-total"><span>Total</span><strong>₹{{ "%.2f"|format(total|float) }}</strong></div>
+  <form method="post" action="{{ url_for('checkout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="button">Place order</button></form>
+  {% else %}<div class="empty">Your cart is empty. <a href="{{ url_for('shop') }}">Browse products</a>.</div>{% endif %}
+</div>
+{% endblock %}

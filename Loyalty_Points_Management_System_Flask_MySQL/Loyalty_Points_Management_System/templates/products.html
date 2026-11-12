@@ -1,0 +1,20 @@
+{% extends "base.html" %}{% block heading %}Product catalogue{% endblock %}{% block content %}
+<div class="two-col align-start">
+  <div class="form-panel"><h3>Add a product</h3><p>Products added here become available to signed-in customers.</p>
+    <form method="post" class="form-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Product name<input name="name" required maxlength="40"></label>
+      <label>Description<input name="description" maxlength="255"></label>
+      <label>Price (₹)<input type="number" name="price" min="0.01" step="0.01" required></label>
+      <button class="button">Add product</button>
+    </form>
+  </div>
+  <div class="panel"><h3>Catalogue management</h3><p class="muted">Customer orders use the listed price and store the product name and price on each order line.</p></div>
+</div>
+<div class="panel"><div class="panel-head"><div><h3>Products</h3><p>{{ products|length }} in catalogue</p></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Product</th><th>Description</th><th>Price</th><th>Status</th></tr></thead><tbody>
+  {% for product in products %}<tr><td><b>{{ product.name }}</b></td><td>{{ product.description or "—" }}</td><td>₹{{ "%.2f"|format(product.price|float) }}</td><td><span class="pill">{{ "Active" if product.active else "Inactive" }}</span></td></tr>
+  {% else %}<tr><td colspan="4" class="empty">No products yet. Add products above to open the shop.</td></tr>{% endfor %}
+  </tbody></table></div>
+</div>
+{% endblock %}

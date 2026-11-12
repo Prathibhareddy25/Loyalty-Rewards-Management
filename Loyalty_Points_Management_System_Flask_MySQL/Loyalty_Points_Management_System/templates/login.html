@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in · LoyaltyHub{% endblock %}
+{% block auth_content %}
+<div class="auth-card">
+  <div class="brand auth-brand"><span class="brand-mark">L</span><div><b>LoyaltyHub</b><small>Points management</small></div></div>
+  <h1>Welcome back</h1><p>Sign in to your customer account or use the administrator credentials configured in `.env`.</p>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category,message in messages %}<div class="alert alert-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+  <form method="post" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Email address<input type="email" name="email" required autocomplete="username"></label>
+    <label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+    <button class="button">Sign in</button>
+  </form>
+  <div class="auth-switch">New customer? <a href="{{ url_for('register') }}">Create an account</a></div>
+</div>
+{% endblock %}

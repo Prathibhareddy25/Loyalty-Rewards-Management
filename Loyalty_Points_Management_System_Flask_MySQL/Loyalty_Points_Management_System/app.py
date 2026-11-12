@@ -1,21 +1,27 @@
 import csv
+import hmac
 import os
+import secrets
 from io import StringIO
 from datetime import datetime, date, timedelta
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, flash, Response
+from flask import Flask, abort, render_template, request, redirect, url_for, flash, Response, session
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, inspect as sa_inspect, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import joinedload, synonym
 from dotenv import load_dotenv
+from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-this-secret-key")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "").lower() == "true"
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
     "DATABASE_URL", "mysql+pymysql://root:password@localhost:3306/loyalty_db"
 )
@@ -60,8 +66,18 @@ class Customer(db.Model):
     full_name = db.Column("first_name", db.String(80), nullable=False)
     email = db.Column(db.String(150), unique=True, nullable=False)
     phone = db.Column(db.String(30))
+    password_hash = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     account = db.relationship("LoyaltyAccount", backref="customer", uselist=False)
+
+class Product(db.Model):
+    __tablename__ = "product"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(40), nullable=False)
+    description = db.Column(db.String(255), nullable=False, default="")
+    price = db.Column(db.Numeric(12,2), nullable=False)
+    active = db.Column(db.Boolean, nullable=False, default=True)
 
 class LoyaltyAccount(db.Model):
     __tablename__ = "loyaltyaccount"
@@ -215,7 +231,10 @@ def migrate_existing_schema():
             )
 
     additions = {
-        "customer": {"phone": "VARCHAR(30) NULL"},
+        "customer": {
+            "phone": "VARCHAR(30) NULL",
+            "password_hash": "VARCHAR(255) NULL",
+        },
         "tier": {"active": "BOOLEAN NOT NULL DEFAULT TRUE"},
         "loyaltyaccount": {"qualifying_spend": "DECIMAL(12,2) NOT NULL DEFAULT 0"},
         "rule": {
@@ -307,8 +326,168 @@ def record_transaction(account_id, kind, points, description, order_id=None,
     db.session.add(tx)
     return tx
 
+def accrue_order_points(order, account, net_amount):
+    rule = Rule.query.filter_by(active=True).order_by(Rule.id.desc()).first()
+    rate = Decimal(account.tier.earning_rate) * (
+        Decimal(rule.points_per_currency) if rule else Decimal("1")
+    )
+    minimum = Decimal(rule.minimum_order_amount) if rule else Decimal("0")
+    points = int(net_amount * rate) if net_amount >= minimum else 0
+    if points:
+        expiry_days = rule.expiry_days if rule else 365
+        record_transaction(
+            account.id,
+            "ACCRUAL",
+            points,
+            f"Earned on {order.order_code}",
+            order_id=order.id,
+            expiry_date=date.today() + timedelta(days=expiry_days),
+        )
+    account.qualifying_spend = Decimal(account.qualifying_spend) + net_amount
+    refresh_tier(account)
+    return points
+
+def csrf_token():
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+    return session["_csrf_token"]
+
+@app.before_request
+def validate_csrf_token():
+    if request.method == "POST":
+        expected = session.get("_csrf_token")
+        submitted = request.form.get("csrf_token", "")
+        if not expected or not submitted or not hmac.compare_digest(expected, submitted):
+            abort(400, description="The form expired or was invalid. Please reload and try again.")
+
+@app.context_processor
+def provide_template_context():
+    return {
+        "csrf_token": csrf_token,
+        "current_role": session.get("role"),
+        "current_email": session.get("email"),
+    }
+
+def roles_required(*roles):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if session.get("role") not in roles:
+                if session.get("role"):
+                    flash("You do not have permission to access that page.", "danger")
+                    destination = "shop" if session.get("role") == "customer" else "dashboard"
+                    return redirect(url_for(destination))
+                return redirect(url_for("login"))
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+def current_customer():
+    if session.get("role") != "customer":
+        return None
+    return db.session.get(Customer, session.get("customer_id"))
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("role") == "admin":
+        return redirect(url_for("dashboard"))
+    if session.get("role") == "customer":
+        return redirect(url_for("shop"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+        admin_password = os.getenv("ADMIN_PASSWORD", "")
+        if (admin_email and admin_password and email == admin_email
+                and hmac.compare_digest(password, admin_password)):
+            session.clear()
+            session["role"] = "admin"
+            session["email"] = admin_email
+            return redirect(url_for("dashboard"))
+
+        existing_tables = set(sa_inspect(db.engine).get_table_names())
+        database_ready = set(db.metadata.tables).issubset(existing_tables)
+        if database_ready:
+            customer_columns = {
+                column["name"] for column in sa_inspect(db.engine).get_columns("customer")
+            }
+            database_ready = "password_hash" in customer_columns
+        if not database_ready:
+            if admin_email and admin_password:
+                flash("The database is not initialized. Sign in with the configured administrator credentials to set it up.", "warning")
+            else:
+                flash("The database is not initialized and administrator sign-in is not configured. Set ADMIN_EMAIL and ADMIN_PASSWORD in .env, restart the app, then sign in to initialize it.", "danger")
+            return render_template("login.html")
+
+        customer = Customer.query.filter_by(email=email).first() if email else None
+        if customer and customer.password_hash and check_password_hash(customer.password_hash, password):
+            session.clear()
+            session["role"] = "customer"
+            session["customer_id"] = customer.id
+            session["email"] = customer.email
+            return redirect(url_for("shop"))
+        flash("Invalid email or password.", "danger")
+    return render_template("login.html")
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if session.get("role"):
+        return redirect(url_for("shop" if session.get("role") == "customer" else "dashboard"))
+    if request.method == "POST":
+        name = request.form.get("full_name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        phone = request.form.get("phone", "").strip()
+        password = request.form.get("password", "")
+        if not name or len(name) > 80 or not email or len(email) > 150:
+            flash("Enter a name of at most 80 characters and a valid email address.", "danger")
+        elif len(phone) > 30:
+            flash("Phone number must be at most 30 characters.", "danger")
+        elif len(password) < 8:
+            flash("Password must be at least 8 characters.", "danger")
+        elif Customer.query.filter_by(email=email).first():
+            flash("An account already uses that email. Please sign in or contact the administrator.", "danger")
+        else:
+            tier = Tier.query.filter_by(active=True).order_by(Tier.min_qualifying_spend.asc()).first()
+            if not tier:
+                flash("Customer registration is not ready yet. Ask the administrator to initialize the database.", "danger")
+            else:
+                customer = Customer(
+                    id=next_code("CUS-", Customer, width=6),
+                    full_name=name,
+                    email=email,
+                    phone=phone,
+                    password_hash=generate_password_hash(password),
+                )
+                db.session.add(customer)
+                db.session.flush()
+                account = LoyaltyAccount(
+                    id=next_code("LOY-", LoyaltyAccount, width=6),
+                    customer_id=customer.id,
+                    tier_id=tier.id,
+                )
+                db.session.add(account)
+                db.session.commit()
+                session.clear()
+                session["role"] = "customer"
+                session["customer_id"] = customer.id
+                session["email"] = customer.email
+                flash("Your customer account is ready. Start shopping.", "success")
+                return redirect(url_for("shop"))
+    return render_template("register.html")
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("login"))
+
 @app.route("/")
+@roles_required("admin", "customer")
 def dashboard():
+    if session.get("role") == "customer":
+        return redirect(url_for("shop"))
+    if not set(db.metadata.tables).issubset(set(sa_inspect(db.engine).get_table_names())):
+        return redirect(url_for("setup"))
     customers = Customer.query.count()
     orders = Order.query.count()
     transactions = PointsTransaction.query.count()
@@ -321,30 +500,44 @@ def dashboard():
         recent=recent, tier_counts=tier_counts)
 
 @app.route("/customers")
+@roles_required("admin")
 def customers():
     q = request.args.get("q","").strip()
     query = Customer.query
     if q:
         query = query.filter(or_(Customer.full_name.ilike(f"%{q}%"),
                                  Customer.customer_code.ilike(f"%{q}%"),
-                                 Customer.email.ilike(f"%{q}%")))
-    customer_rows = query.order_by(Customer.id.desc()).limit(300).all()
+                                 Customer.email.ilike(f"%{q}%"),
+                                 Customer.phone.ilike(f"%{q}%")))
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    pagination = query.order_by(Customer.id.desc()).paginate(page=page, per_page=100, error_out=False)
+    customer_rows = pagination.items
     balances = {c.account.id: balance_for(c.account.id) for c in customer_rows if c.account}
-    return render_template("customers.html", customers=customer_rows, balances=balances, q=q)
+    return render_template("customers.html", customers=customer_rows, balances=balances, q=q,
+        pagination=pagination)
 
 @app.route("/customers/new", methods=["GET","POST"])
+@roles_required("admin")
 def new_customer():
     if request.method == "POST":
         name=request.form["full_name"].strip()
         email=request.form["email"].strip().lower()
-        if not name or not email:
-            flash("Name and email are required.", "danger")
+        phone = request.form.get("phone", "").strip()
+        password = request.form.get("password", "")
+        if not name or len(name) > 80 or not email or len(email) > 150 or len(phone) > 30:
+            flash("Enter valid name, email and phone values within their length limits.", "danger")
+        elif password and len(password) < 8:
+            flash("An initial password must be at least 8 characters.", "danger")
         elif Customer.query.filter_by(email=email).first():
             flash("This email is already registered.", "danger")
         else:
             customer_code=next_code("CUS-",Customer,width=6)
             customer=Customer(id=customer_code,
-                full_name=name,email=email,phone=request.form.get("phone","").strip())
+                full_name=name,email=email,phone=phone,
+                password_hash=generate_password_hash(password) if password else None)
             db.session.add(customer); db.session.flush()
             tier=Tier.query.order_by(Tier.min_qualifying_spend.asc()).first()
             if not tier:
@@ -358,8 +551,146 @@ def new_customer():
             return redirect(url_for("customers"))
     return render_template("customer_form.html")
 
+@app.route("/customers/<customer_id>/password", methods=["POST"])
+@roles_required("admin")
+def set_customer_password(customer_id):
+    customer = Customer.query.get_or_404(customer_id)
+    password = request.form.get("password", "")
+    if len(password) < 8:
+        flash("Customer password must be at least 8 characters.", "danger")
+    else:
+        customer.password_hash = generate_password_hash(password)
+        db.session.commit()
+        flash(f"Login password updated for {customer.email}.", "success")
+    return redirect(url_for("customers"))
+
+@app.route("/products", methods=["GET", "POST"])
+@roles_required("admin")
+def products():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        description = request.form.get("description", "").strip()
+        try:
+            price = Decimal(request.form.get("price", ""))
+        except (InvalidOperation, ValueError):
+            price = Decimal("0")
+        if not name or len(name) > 40 or len(description) > 255 or not price.is_finite() or price <= 0:
+            flash("Enter a product name (up to 40 characters), description (up to 255), and positive price.", "danger")
+        else:
+            db.session.add(Product(name=name, description=description, price=price, active=True))
+            db.session.commit()
+            flash("Product added to the catalogue.", "success")
+            return redirect(url_for("products"))
+    return render_template("products.html", products=Product.query.order_by(Product.id.desc()).all())
+
+@app.route("/shop")
+@roles_required("customer")
+def shop():
+    return render_template(
+        "shop.html",
+        products=Product.query.filter_by(active=True).order_by(Product.name.asc()).all(),
+        cart_count=sum(session.get("cart", {}).values()),
+    )
+
+@app.route("/cart")
+@roles_required("customer")
+def cart():
+    cart_items = session.get("cart", {})
+    products_by_id = {
+        str(product.id): product
+        for product in Product.query.filter(
+            Product.active.is_(True),
+            Product.id.in_([int(product_id) for product_id in cart_items])
+        ).all()
+    } if cart_items else {}
+    items = [
+        (products_by_id[product_id], quantity)
+        for product_id, quantity in cart_items.items()
+        if product_id in products_by_id
+    ]
+    total = sum((Decimal(product.price) * quantity for product, quantity in items), Decimal("0"))
+    return render_template("cart.html", items=items, total=total)
+
+@app.route("/cart/add/<int:product_id>", methods=["POST"])
+@roles_required("customer")
+def add_to_cart(product_id):
+    product = Product.query.filter_by(id=product_id, active=True).first_or_404()
+    try:
+        quantity = int(request.form.get("quantity", "1"))
+    except ValueError:
+        quantity = 0
+    cart_items = session.get("cart", {})
+    current_quantity = int(cart_items.get(str(product.id), 0))
+    if quantity < 1 or current_quantity + quantity > 99:
+        flash("Choose a quantity between 1 and 99 per product.", "danger")
+    else:
+        cart_items[str(product.id)] = current_quantity + quantity
+        session["cart"] = cart_items
+        flash(f"{product.name} added to your cart.", "success")
+    return redirect(url_for("shop"))
+
+@app.route("/cart/remove/<int:product_id>", methods=["POST"])
+@roles_required("customer")
+def remove_from_cart(product_id):
+    cart_items = session.get("cart", {})
+    cart_items.pop(str(product_id), None)
+    session["cart"] = cart_items
+    return redirect(url_for("cart"))
+
+@app.route("/checkout", methods=["POST"])
+@roles_required("customer")
+def checkout():
+    customer = current_customer()
+    if not customer or not customer.account:
+        session.clear()
+        return redirect(url_for("login"))
+    cart_items = session.get("cart", {})
+    if not cart_items:
+        flash("Your cart is empty.", "warning")
+        return redirect(url_for("shop"))
+    product_ids = [int(product_id) for product_id in cart_items]
+    products_by_id = {
+        str(product.id): product
+        for product in Product.query.filter(Product.active.is_(True), Product.id.in_(product_ids)).all()
+    }
+    if len(products_by_id) != len(cart_items):
+        flash("One or more products are no longer available. Review your cart and try again.", "danger")
+        return redirect(url_for("cart"))
+
+    items = [(products_by_id[product_id], int(quantity)) for product_id, quantity in cart_items.items()]
+    total = sum((Decimal(product.price) * quantity for product, quantity in items), Decimal("0"))
+    order_code = next_code("ORD-2026-", Order, width=6)
+    order = Order(
+        id=order_code,
+        customer_id=customer.id,
+        gross_amount=total,
+        discount_amount=0,
+        net_amount=total,
+        qualifying_spend=total,
+        status="COMPLETED",
+    )
+    db.session.add(order)
+    db.session.flush()
+    for product, quantity in items:
+        db.session.add(OrderLine(
+            id=next_code("LINE-", OrderLine),
+            order_id=order.id,
+            item_name=product.name,
+            quantity=quantity,
+            unit_price=product.price,
+            line_total=Decimal(product.price) * quantity,
+        ))
+    points = accrue_order_points(order, customer.account, total)
+    db.session.commit()
+    session["cart"] = {}
+    flash(f"Order placed. {points} loyalty points accrued.", "success")
+    return redirect(url_for("orders"))
+
 @app.route("/orders", methods=["GET","POST"])
+@roles_required("admin", "customer")
 def orders():
+    if request.method == "POST" and session.get("role") != "admin":
+        abort(403)
     if request.method=="POST":
         customer=Customer.query.get_or_404(request.form["customer_id"])
         gross=Decimal(request.form["gross_amount"])
@@ -377,26 +708,34 @@ def orders():
             db.session.add(OrderLine(id=next_code("LINE-",OrderLine),order_id=order.id,item_name=item_name,
                 quantity=1,unit_price=net,line_total=net))
             account=customer.account
-            rule=Rule.query.filter_by(active=True).order_by(Rule.id.desc()).first()
-            rate=Decimal(account.tier.earning_rate) * (Decimal(rule.points_per_currency) if rule else Decimal("1"))
-            minimum=Decimal(rule.minimum_order_amount) if rule else Decimal("0")
-            points=int((net*rate).to_integral_value(rounding=ROUND_FLOOR)) if net>=minimum else 0
-            if points:
-                expiry_days=rule.expiry_days if rule else 365
-                record_transaction(account.id,"ACCRUAL",points,f"Earned on {order.order_code}",
-                    order_id=order.id,expiry_date=date.today()+timedelta(days=expiry_days))
-            account.qualifying_spend=Decimal(account.qualifying_spend)+net
-            refresh_tier(account)
+            points = accrue_order_points(order, account, net)
             db.session.commit()
             flash(f"Order saved. {points} points accrued.", "success")
             return redirect(url_for("orders"))
-    recent=Order.query.order_by(Order.id.desc()).limit(100).all()
-    return render_template("orders.html", customers=Customer.query.order_by(Customer.full_name).all(), orders=recent)
+    query = Order.query
+    if session.get("role") == "customer":
+        customer = current_customer()
+        if not customer:
+            session.clear()
+            return redirect(url_for("login"))
+        query = query.filter_by(customer_id=customer.id)
+    recent=query.order_by(Order.id.desc()).limit(100).all()
+    return render_template("orders.html",
+        customers=Customer.query.order_by(Customer.full_name).all() if session.get("role") == "admin" else [],
+        orders=recent, is_admin=session.get("role") == "admin")
 
 @app.route("/returns", methods=["GET","POST"])
+@roles_required("admin", "customer")
 def returns():
     if request.method=="POST":
-        order=Order.query.filter_by(order_code=request.form["order_code"].strip()).first()
+        query = Order.query.filter_by(order_code=request.form.get("order_code", "").strip())
+        if session.get("role") == "customer":
+            customer = current_customer()
+            if not customer:
+                session.clear()
+                return redirect(url_for("login"))
+            query = query.filter_by(customer_id=customer.id)
+        order=query.first()
         amount=Decimal(request.form["return_amount"])
         if not order:
             flash("Order not found.", "danger")
@@ -404,30 +743,36 @@ def returns():
             flash("Return amount must be positive and no greater than the unreturned qualifying amount.", "danger")
         else:
             accruals=PointsTransaction.query.filter_by(order_id=order.id,transaction_type="ACCRUAL").all()
-            if not accruals:
-                flash("No accrual exists for this order.", "warning")
-            else:
-                for accrual in accruals:
-                    original_net=Decimal(order.qualifying_spend)
-                    new_returned=Decimal(order.returned_amount)+amount
-                    target_reversal=int((Decimal(accrual.points)*new_returned/original_net).to_integral_value(rounding=ROUND_FLOOR))
-                    already=sum(-int(t.points) for t in PointsTransaction.query.filter_by(
-                        source_accrual_id=accrual.id,transaction_type="REVERSAL").all())
-                    delta=max(0,target_reversal-already)
-                    if delta:
-                        record_transaction(order.customer.account.id,"REVERSAL",-delta,
-                            f"Return against {order.order_code}",order_id=order.id,source_accrual_id=accrual.id)
-                order.returned_amount=Decimal(order.returned_amount)+amount
-                order.status="PARTIALLY_RETURNED" if order.returned_amount<order.qualifying_spend else "REFUNDED"
-                account=order.customer.account
-                account.qualifying_spend=max(Decimal("0"),Decimal(account.qualifying_spend)-amount)
-                refresh_tier(account)
-                db.session.commit()
-                flash("Return recorded and earned points reversed proportionally.", "success")
-                return redirect(url_for("returns"))
-    return render_template("returns.html", orders=Order.query.order_by(Order.id.desc()).limit(100).all())
+            for accrual in accruals:
+                original_net=Decimal(order.qualifying_spend)
+                new_returned=Decimal(order.returned_amount)+amount
+                target_reversal=int((Decimal(accrual.points)*new_returned/original_net).to_integral_value(rounding=ROUND_FLOOR))
+                already=sum(-int(t.points) for t in PointsTransaction.query.filter_by(
+                    source_accrual_id=accrual.id,transaction_type="REVERSAL").all())
+                delta=max(0,target_reversal-already)
+                if delta:
+                    record_transaction(order.customer.account.id,"REVERSAL",-delta,
+                        f"Return against {order.order_code}",order_id=order.id,source_accrual_id=accrual.id)
+            order.returned_amount=Decimal(order.returned_amount)+amount
+            order.status="PARTIALLY_RETURNED" if order.returned_amount<order.qualifying_spend else "REFUNDED"
+            account=order.customer.account
+            account.qualifying_spend=max(Decimal("0"),Decimal(account.qualifying_spend)-amount)
+            refresh_tier(account)
+            db.session.commit()
+            flash("Return recorded and earned points reversed proportionally.", "success")
+            return redirect(url_for("returns"))
+    orders_query = Order.query
+    if session.get("role") == "customer":
+        customer = current_customer()
+        if not customer:
+            session.clear()
+            return redirect(url_for("login"))
+        orders_query = orders_query.filter_by(customer_id=customer.id)
+    return render_template("returns.html", orders=orders_query.order_by(Order.id.desc()).limit(100).all(),
+        is_admin=session.get("role") == "admin")
 
 @app.route("/rewards", methods=["GET","POST"])
+@roles_required("admin")
 def rewards():
     if request.method=="POST":
         name=request.form["name"].strip()
@@ -442,6 +787,7 @@ def rewards():
     return render_template("rewards.html", rewards=Reward.query.order_by(Reward.id.desc()).all())
 
 @app.route("/redeem", methods=["GET","POST"])
+@roles_required("admin")
 def redeem():
     if request.method=="POST":
         account=LoyaltyAccount.query.filter_by(account_code=request.form["account_code"].strip()).first()
@@ -482,6 +828,7 @@ def redeem():
         redemptions=Redemption.query.order_by(Redemption.id.desc()).limit(50).all())
 
 @app.route("/expiry", methods=["GET","POST"])
+@roles_required("admin")
 def expiry():
     if request.method=="POST":
         run_date=date.fromisoformat(request.form.get("run_date") or date.today().isoformat())
@@ -508,6 +855,7 @@ def expiry():
     return render_template("expiry.html", batches=batches, today=date.today().isoformat())
 
 @app.route("/ledger")
+@roles_required("admin")
 def ledger():
     q=request.args.get("q","").strip()
     query=PointsTransaction.query.join(LoyaltyAccount).join(Customer)
@@ -519,6 +867,7 @@ def ledger():
     return render_template("ledger.html", rows=rows, q=q)
 
 @app.route("/reports")
+@roles_required("admin")
 def reports():
     by_type=db.session.query(PointsTransaction.transaction_type,func.count(PointsTransaction.id),
         func.coalesce(func.sum(PointsTransaction.points),0)).group_by(PointsTransaction.transaction_type).all()
@@ -527,6 +876,7 @@ def reports():
     return render_template("reports.html", by_type=by_type,by_tier=by_tier)
 
 @app.route("/export/ledger.csv")
+@roles_required("admin")
 def export_ledger():
     rows=PointsTransaction.query.order_by(PointsTransaction.id.asc()).all()
     def generate():
@@ -551,8 +901,14 @@ def export_ledger():
     return Response(generate(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=points_ledger.csv"})
 
 @app.route("/setup")
+@roles_required("admin")
 def setup():
     migrate_existing_schema()
+    seed_default_data()
+    flash("Database tables and default tiers, rule and rewards are ready.","success")
+    return redirect(url_for("dashboard"))
+
+def seed_default_data():
     if Tier.query.count()==0:
         db.session.add_all([
             Tier(name="Bronze",min_qualifying_spend=0,earning_rate=1.0),
@@ -568,8 +924,6 @@ def setup():
             Reward(id="RWD-0002",name="₹250 Voucher",points_cost=1100),
             Reward(id="RWD-0003",name="Free Shipping",points_cost=200)])
     db.session.commit()
-    flash("Database tables and default tiers, rule and rewards are ready.","success")
-    return redirect(url_for("dashboard"))
 
 @app.route("/health")
 def health():

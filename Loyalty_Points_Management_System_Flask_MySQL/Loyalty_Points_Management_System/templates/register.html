@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Create account · LoyaltyHub{% endblock %}
+{% block auth_content %}
+<div class="auth-card">
+  <div class="brand auth-brand"><span class="brand-mark">L</span><div><b>LoyaltyHub</b><small>Points management</small></div></div>
+  <h1>Create your account</h1><p>Register to shop and manage your orders and returns.</p>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category,message in messages %}<div class="alert alert-{{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+  <form method="post" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Full name<input name="full_name" required maxlength="80" autocomplete="name"></label>
+    <label>Email address<input type="email" name="email" required maxlength="150" autocomplete="email"></label>
+    <label>Phone number <small>(optional)</small><input name="phone" maxlength="30" autocomplete="tel"></label>
+    <label>Password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+    <button class="button">Create account</button>
+  </form>
+  <div class="auth-switch">Already registered? <a href="{{ url_for('login') }}">Sign in</a></div>
+</div>
+{% endblock %}

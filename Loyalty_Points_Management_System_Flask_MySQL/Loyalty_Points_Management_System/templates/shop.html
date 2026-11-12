@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block heading %}Shop{% endblock %}{% block content %}
+<div class="welcome"><div><span class="eyebrow">CUSTOMER SHOP</span><h2>Find your next favorite</h2><p>Add products to your cart, then place your order securely.</p></div><a class="button" href="{{ url_for('cart') }}">View cart ({{ cart_count }})</a></div>
+<div class="product-grid">
+  {% for product in products %}
+  <article class="product-card">
+    <div class="product-art">L</div>
+    <div class="product-copy"><h3>{{ product.name }}</h3><p>{{ product.description or "A great choice from our catalogue." }}</p><strong>₹{{ "%.2f"|format(product.price|float) }}</strong></div>
+    <form method="post" action="{{ url_for('add_to_cart', product_id=product.id) }}" class="product-add">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Qty <input type="number" name="quantity" min="1" max="99" value="1" required></label>
+      <button class="button">Add to cart</button>
+    </form>
+  </article>
+  {% else %}<div class="panel empty">There are no products available right now. Please check back soon.</div>{% endfor %}
+</div>
+{% endblock %}
